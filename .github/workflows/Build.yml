@@ -211,38 +211,16 @@ jobs:
       # ============================================================
       - name: Setup KernelSU-Next (built-in)
         working-directory: kernel_workspace
-        env:
-          KSU_REF: ${{ github.event.inputs.ksu_ref }}
         run: |
           set -euo pipefail
-          KSU_REF="${KSU_REF:-dev-susfs}"
-          echo "Using KernelSU-Next ref: ${KSU_REF}"
-
-          # Run the official setup script from the kernel_workspace root
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "${KSU_REF}"
-
-          # -------- Verification (correct paths) --------
-          echo "----- Listing kernel_workspace -----"
-          ls -la
-
-          # The setup script symlinks common/drivers/kernelsu -> ../KernelSU-Next/kernel
-          KSU_LINK="common/drivers/kernelsu"
-          if [ ! -e "$KSU_LINK" ]; then
-            echo "::error::$KSU_LINK symlink is missing"
-            exit 1
-          fi
-          if [ ! -e "$KSU_LINK/Kbuild" ] && [ ! -e "$KSU_LINK/Makefile" ]; then
-            echo "::error::$KSU_LINK exists but has no Kbuild/Makefile"
-            ls -la "$KSU_LINK" || true
-            exit 1
-          fi
-          echo "[ok] kernelsu linked: $(readlink -f "$KSU_LINK" || echo 'real dir')"
-
-          # drivers/Makefile + drivers/Kconfig must be wired
-          grep -q 'kernelsu' common/drivers/Makefile  || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Kconfig   || { echo "::error::drivers/Kconfig does not source kernelsu"; exit 1; }
-
-          echo "[ok] KernelSU-Next ${KSU_REF} integrated successfully"
+          # Official repository ka next branch istemal karen, argument dev_susfs pass karen
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s dev_susfs
+          
+          # Verify karen ke symlink aur Makefile sahi integrate hue hain ya nahi
+          [ -e "common/drivers/kernelsu" ] || { echo "::error::kernelsu link missing"; exit 1; }
+          grep -q 'kernelsu' common/drivers/Makefile || { echo "::error::Makefile not wired"; exit 1; }
+          grep -q 'kernelsu' common/drivers/Kconfig || { echo "::error::Kconfig not wired"; exit 1; }
+          echo "KernelSU-Next integrated successfully"
 
       # make mrproper runs before any .config exists, so CONFIG_KSU_SUSFS is still
       # unset and KernelSU-Next's Kbuild hard check kills the build.
