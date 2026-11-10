@@ -12,9 +12,9 @@ on:
         required: false
         default: ""
       ksu_ref:
-        description: "KernelSU-Next branch / tag (SUSFS-enabled branch, e.g. dev_susfs)"
+        description: "KernelSU-Next branch / tag (SUSFS-enabled branch, e.g. dev-susfs)"
         required: true
-        default: "dev_susfs"
+        default: "dev-susfs"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -98,7 +98,6 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            # KernelSU-Next built-in
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_HAVE_KPROBES=y"
@@ -192,9 +191,6 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Clang builds the GKI tree with -Werror, and fs/susfs.c ships two static
-      # helpers that nothing calls with this config -> -Wunused-function becomes
-      # a hard error. Mark them __maybe_unused, with a pragma fallback.
       - name: Fix SUSFS unused-function build errors (fs/susfs.c)
         working-directory: kernel_workspace/common
         run: |
@@ -208,33 +204,59 @@ jobs:
             grep -q 'Wunused-function' fs/susfs.c || sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' fs/susfs.c
           fi
 
-      # KernelSU-Next is built INTO the kernel (CONFIG_KSU=y). Its setup.sh links
-      # KernelSU-Next/kernel into common/drivers/kernelsu and wires
-      # drivers/Makefile + drivers/Kconfig. A SUSFS-enabled branch (dev_susfs)
-      # already carries the KernelSU-side SUSFS code, so the driver-side
-      # 10_enable_susfs_for_ksu.patch is NOT applied here.
-      - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
-        working-directory: kernel_workspace/common
+      # ============================================================
+      # FIXED STEP: KernelSU-Next (built-in)
+      # setup.sh runs from kernel_workspace root and clones into ./KernelSU-Next,
+      # then symlinks common/drivers/kernelsu -> ../KernelSU-Next/kernel
+      # ============================================================
+      - name: Setup KernelSU-Next (built-in)
+        working-directory: kernel_workspace
+        env:
+          KSU_REF: ${{ github.event.inputs.ksu_ref }}
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          KSU_REF="${KSU_REF:-dev-susfs}"
+          echo "Using KernelSU-Next ref: ${KSU_REF}"
 
-          # Verify the integration actually landed
-          [ -f common/drivers/kernelsu/Kbuild ] || { echo "::error::drivers/kernelsu is missing or broken"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Makefile || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Kconfig || { echo "::error::drivers/Kconfig does not source kernelsu"; exit 1; }
-          echo "KernelSU-Next ref: ${KSU_REF}"
+          # Run the official setup script from the kernel_workspace root
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "${KSU_REF}"
+
+          # -------- Verification (correct paths) --------
+          echo "----- Listing kernel_workspace -----"
+          ls -la
+
+          # The setup script symlinks common/drivers/kernelsu -> ../KernelSU-Next/kernel
+          KSU_LINK="common/drivers/kernelsu"
+          if [ ! -e "$KSU_LINK" ]; then
+            echo "::error::$KSU_LINK symlink is missing"
+            exit 1
+          fi
+          if [ ! -e "$KSU_LINK/Kbuild" ] && [ ! -e "$KSU_LINK/Makefile" ]; then
+            echo "::error::$KSU_LINK exists but has no Kbuild/Makefile"
+            ls -la "$KSU_LINK" || true
+            exit 1
+          fi
+          echo "[ok] kernelsu linked: $(readlink -f "$KSU_LINK" || echo 'real dir')"
+
+          # drivers/Makefile + drivers/Kconfig must be wired
+          grep -q 'kernelsu' common/drivers/Makefile  || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
+          grep -q 'kernelsu' common/drivers/Kconfig   || { echo "::error::drivers/Kconfig does not source kernelsu"; exit 1; }
+
+          echo "[ok] KernelSU-Next ${KSU_REF} integrated successfully"
 
       # make mrproper runs before any .config exists, so CONFIG_KSU_SUSFS is still
-      # unset and KernelSU-Next's Kbuild hard check
-      # `$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")`
-      # kills the build. Delete that line (the real build still has both configs set).
+      # unset and KernelSU-Next's Kbuild hard check kills the build.
       - name: Remove KernelSU-Next pre-config Kbuild hard check
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          KB="drivers/kernelsu/Kbuild"
-          [ -f "$KB" ] || { echo "::error::$KB not found"; exit 1; }
+          # Path may be either the symlinked dir or the real one
+          KB=""
+          for cand in drivers/kernelsu/Kbuild ../KernelSU-Next/kernel/Kbuild; do
+            [ -f "$cand" ] && KB="$cand" && break
+          done
+          [ -n "$KB" ] || { echo "::error::Kbuild not found"; exit 1; }
+          echo "Checking $KB"
           if grep -q 'KernelSU requires' "$KB"; then
             sed -i '/\$(error "KernelSU requires/d' "$KB"
             echo "[ok] removed pre-config hard check from $KB"
@@ -242,12 +264,9 @@ jobs:
             echo "[info] no hard check found in $KB — nothing to remove"
           fi
 
-      # NoMount (maxsteeel/nomount) built INTO the kernel, following its
-      # kernel/README.md: Method 1 = run kernel/setup.sh at the kernel tree root
-      # (patches fs/Kconfig + fs/Makefile and copies the sources into fs/nomount/).
-      # Fallback = Method 3 (manual: copy kernel/src/* to fs/nomount/, wire
-      # Kconfig + Makefile). After flashing, also flash the NoMount metamodule
-      # ZIP (Releases or nightly) in KernelSU-Next and reboot.
+      # ============================================================
+      # NoMount (built-in)
+      # ============================================================
       - name: Integrate NoMount (built-in)
         if: ${{ github.event.inputs.enable_nomount == 'true' }}
         working-directory: kernel_workspace/common
@@ -257,11 +276,9 @@ jobs:
           set -euo pipefail
           NM_BRANCH="${NM_BRANCH:-dev}"
 
-          # Method 1: automatic setup script
           curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/${NM_BRANCH}/kernel/setup.sh" | bash -s "${NM_BRANCH}" \
             || echo "::warning::NoMount setup.sh failed — trying manual integration"
 
-          # Method 3 fallback: manual integration if the script left it half-wired
           if [ ! -f fs/nomount/Kconfig ] || ! grep -q 'nomount' fs/Makefile || ! grep -q 'nomount' fs/Kconfig; then
             echo "::warning::setup.sh result incomplete — doing manual integration"
             rm -rf /tmp/nomount_src
@@ -278,6 +295,9 @@ jobs:
           echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
           echo "NoMount integrated: $(ls fs/nomount | wc -l) files (branch ${NM_BRANCH})"
 
+      # ============================================================
+      # Baseband Guard (BBG)
+      # ============================================================
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
@@ -310,6 +330,9 @@ jobs:
           cd kernel_workspace/common/arch/arm64/configs
           echo "CONFIG_BBG=y" >> gki_defconfig
 
+      # ============================================================
+      # BBRv3
+      # ============================================================
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
         run: |
@@ -610,7 +633,6 @@ jobs:
       - name: Build kernel
         working-directory: kernel_workspace
         env:
-          # Safety net: never let a leftover unused static helper break the build
           KCFLAGS: "-Wno-error=unused-function"
         run: |
           set -euo pipefail
