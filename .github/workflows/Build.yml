@@ -213,14 +213,11 @@ jobs:
       # drivers/Makefile + drivers/Kconfig. A SUSFS-enabled branch (dev_susfs)
       # already carries the KernelSU-side SUSFS code, so the driver-side
       # 10_enable_susfs_for_ksu.patch is NOT applied here.
-      - name: Setup KernelSU-Next (built-in)
-        working-directory: kernel_workspace
-        env:
-          KSU_REF: ${{ github.event.inputs.ksu_ref }}
+      - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
+        working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          KSU_REF="${KSU_REF:-dev_susfs}"
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "${KSU_REF}"
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
 
           # Verify the integration actually landed
           [ -f common/drivers/kernelsu/Kbuild ] || { echo "::error::drivers/kernelsu is missing or broken"; exit 1; }
