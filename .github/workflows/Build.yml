@@ -12,9 +12,9 @@ on:
         required: false
         default: ""
       ksu_ref:
-        description: "KernelSU-Next branch / tag (SUSFS-enabled branch, e.g. dev-susfs)"
+        description: "KernelSU-Next branch passed to setup.sh (SUSFS-enabled branch, e.g. dev_susfs)"
         required: true
-        default: "dev-susfs"
+        default: "dev_susfs"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -208,18 +208,27 @@ jobs:
       # FIXED STEP: KernelSU-Next (built-in)
       # setup.sh runs from kernel_workspace root and clones into ./KernelSU-Next,
       # then symlinks common/drivers/kernelsu -> ../KernelSU-Next/kernel
+      # Branch ab ksu_ref input se aati hai (default: dev_susfs).
       # ============================================================
       - name: Setup KernelSU-Next (built-in)
         working-directory: kernel_workspace
+        env:
+          KSU_REF: ${{ github.event.inputs.ksu_ref }}
         run: |
           set -euo pipefail
-          # Official repository ka next branch istemal karen, argument dev_susfs pass karen
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s dev_susfs
-          
+          KSU_REF="${KSU_REF:-dev_susfs}"
+          # SUSFS wali branch ka naam underscore ke saath hota hai (dev_susfs), hyphen ke saath nahi
+          KSU_REF="${KSU_REF//-/_}"
+          echo "KernelSU-Next ref: ${KSU_REF}"
+
+          curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${KSU_REF}"
+
           # Verify karen ke symlink aur Makefile sahi integrate hue hain ya nahi
           [ -e "common/drivers/kernelsu" ] || { echo "::error::kernelsu link missing"; exit 1; }
           grep -q 'kernelsu' common/drivers/Makefile || { echo "::error::Makefile not wired"; exit 1; }
           grep -q 'kernelsu' common/drivers/Kconfig || { echo "::error::Kconfig not wired"; exit 1; }
+
+          echo "KSU checkout: $(git -C KernelSU-Next rev-parse --abbrev-ref HEAD) @ $(git -C KernelSU-Next rev-parse --short HEAD)"
           echo "KernelSU-Next integrated successfully"
 
       # make mrproper runs before any .config exists, so CONFIG_KSU_SUSFS is still
@@ -240,6 +249,47 @@ jobs:
             echo "[ok] removed pre-config hard check from $KB"
           else
             echo "[info] no hard check found in $KB — nothing to remove"
+          fi
+
+      # ============================================================
+      # NEW: Agar KernelSU-Next ki Kconfig me KSU_SUSFS symbol define hi nahi hai
+      # to Kconfig use silently drop kar deta hai (final .config me missing).
+      # Ye step check karta hai aur sirf missing symbols fs/Kconfig me add karta hai.
+      # ============================================================
+      - name: Ensure KSU_SUSFS Kconfig symbols exist
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          KSU_DIR="../KernelSU-Next"
+          [ -d "$KSU_DIR" ] || KSU_DIR="drivers/kernelsu"
+
+          defined() {
+            grep -rqsE --include=Kconfig "^[[:space:]]*config[[:space:]]+$1[[:space:]]*$" "$KSU_DIR" fs security drivers 2>/dev/null
+          }
+
+          echo "== KSU / SUSFS symbols defined in Kconfig =="
+          grep -rnE --include=Kconfig "^[[:space:]]*config[[:space:]]+KSU" "$KSU_DIR" fs 2>/dev/null || true
+
+          ADDED=0
+          if ! defined KSU_SUSFS; then
+            echo "::warning::KSU_SUSFS not defined by KernelSU-Next — adding fallback to fs/Kconfig"
+            printf '\nconfig KSU_SUSFS\n\tbool "KernelSU addon - SUSFS"\n\tdepends on KSU\n\tdefault y\n' >> fs/Kconfig
+            ADDED=1
+          fi
+
+          for s in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG OPEN_REDIRECT SUS_MAP; do
+            if ! defined "KSU_SUSFS_${s}"; then
+              printf '\nconfig KSU_SUSFS_%s\n\tbool "KSU_SUSFS_%s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$s" "$s" >> fs/Kconfig
+              echo "[fallback] added KSU_SUSFS_${s}"
+              ADDED=1
+            fi
+          done
+
+          # fs/susfs.c SUSFS patch ke baad build hona chahiye
+          grep -q 'susfs' fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+
+          if [ "$ADDED" -eq 0 ]; then
+            echo "[ok] all SUSFS Kconfig symbols already defined by KernelSU-Next"
           fi
 
       # ============================================================
@@ -630,8 +680,15 @@ jobs:
           CFG="$(find out -name .config -path '*common*' | head -n1)"
           [ -n "$CFG" ] || { echo "::error::final .config not found under out/"; exit 1; }
           echo "Using $CFG"
+          echo "== KSU / SUSFS / KPROBES lines in final .config =="
+          grep -E 'KSU|SUSFS|KPROBES' "$CFG" || true
           for opt in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KPROBES; do
-            grep -q "^${opt}=y$" "$CFG" || { echo "::error::${opt}=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
+            if ! grep -q "^${opt}=y$" "$CFG"; then
+              echo "::error::${opt}=y is missing from the final .config (dropped by a Kconfig dependency?)"
+              echo "== Kconfig definition of ${opt#CONFIG_} =="
+              grep -rn -B2 -A10 --include=Kconfig -E "^[[:space:]]*config[[:space:]]+${opt#CONFIG_}[[:space:]]*$" common KernelSU-Next 2>/dev/null || true
+              exit 1
+            fi
           done
           if [ "${{ github.event.inputs.enable_nomount }}" = "true" ]; then
             grep -q '^CONFIG_NOMOUNT=y$' "$CFG" || { echo "::error::CONFIG_NOMOUNT=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
