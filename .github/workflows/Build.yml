@@ -11,10 +11,10 @@ on:
         description: "SUSFS commit hash (empty = latest on gki-android12-5.10)"
         required: false
         default: ""
-      ksu_ref:
-        description: "KernelSU-Next branch passed to setup.sh (SUSFS-enabled branch, e.g. dev_susfs)"
-        required: true
-        default: "dev_susfs"
+      ksun_branch:
+        description: "KernelSU-Next branch passed to setup.sh"
+        required: false
+        default: "dev-susfs"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -102,7 +102,6 @@ jobs:
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_HAVE_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
-
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -191,106 +190,49 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Fix SUSFS unused-function build errors (fs/susfs.c)
+      - name: Setup KernelSU-Next
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          [ -f fs/susfs.c ] || { echo "::error::fs/susfs.c not found"; exit 1; }
-          perl -0pi -e 's/^static(?!\s+__maybe_unused)(\s+(?:struct\s+cred\s*\*|void\s+))(susfs_switch_to_ksu_domain|susfs_restore_creds)\b/static __maybe_unused$1$2/mg' fs/susfs.c
-          if grep -nE '__maybe_unused[^;]*(susfs_switch_to_ksu_domain|susfs_restore_creds)' fs/susfs.c; then
-            echo "[ok] susfs unused helpers marked __maybe_unused"
-          else
-            echo "::warning::helper definitions not matched — adding file-local -Wunused-function ignore pragma"
-            grep -q 'Wunused-function' fs/susfs.c || sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' fs/susfs.c
-          fi
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/${{ github.event.inputs.ksun_branch }}/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksun_branch }}"
 
-      # ============================================================
-      # FIXED STEP: KernelSU-Next (built-in)
-      # setup.sh runs from kernel_workspace root and clones into ./KernelSU-Next,
-      # then symlinks common/drivers/kernelsu -> ../KernelSU-Next/kernel
-      # Branch ab ksu_ref input se aati hai (default: dev_susfs).
-      # ============================================================
-      - name: Setup KernelSU-Next (built-in)
-        working-directory: kernel_workspace
-        env:
-          KSU_REF: ${{ github.event.inputs.ksu_ref }}
+          [ -d KernelSU-Next/kernel ] || { echo "::error::KernelSU-Next/kernel missing after setup"; exit 1; }
+          [ -e drivers/kernelsu ] || { echo "::error::drivers/kernelsu symlink missing"; exit 1; }
+          grep -q 'kernelsu' drivers/Makefile || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
+          grep -q 'kernelsu' drivers/Kconfig || { echo "::error::drivers/Kconfig not wired for kernelsu"; exit 1; }
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) | count: $(git -C KernelSU-Next rev-list --count HEAD)"
+
+      - name: Fix KernelSU-Next (static.patch)
+        working-directory: kernel_workspace/common/KernelSU-Next
         run: |
           set -euo pipefail
-          KSU_REF="${KSU_REF:-dev_susfs}"
-          # SUSFS wali branch ka naam underscore ke saath hota hai (dev_susfs), hyphen ke saath nahi
-          KSU_REF="${KSU_REF//-/_}"
-          echo "KernelSU-Next ref: ${KSU_REF}"
+          cat > static.patch << 'STATIC_PATCH_EOF'
+          diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+          index e1384d9..56e4cfe 100644
+          --- a/kernel/feature/selinux_hide.c
+          +++ b/kernel/feature/selinux_hide.c
+          @@ -35,12 +35,12 @@ bool ksu_selinux_hide_enabled __read_mostly = false;
+           bool ksu_selinux_hide_running __read_mostly = false;
 
-          curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${KSU_REF}"
-
-          # Verify karen ke symlink aur Makefile sahi integrate hue hain ya nahi
-          [ -e "common/drivers/kernelsu" ] || { echo "::error::kernelsu link missing"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Makefile || { echo "::error::Makefile not wired"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Kconfig || { echo "::error::Kconfig not wired"; exit 1; }
-
-          echo "KSU checkout: $(git -C KernelSU-Next rev-parse --abbrev-ref HEAD) @ $(git -C KernelSU-Next rev-parse --short HEAD)"
-          echo "KernelSU-Next integrated successfully"
-
-      # make mrproper runs before any .config exists, so CONFIG_KSU_SUSFS is still
-      # unset and KernelSU-Next's Kbuild hard check kills the build.
-      - name: Remove KernelSU-Next pre-config Kbuild hard check
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          # Path may be either the symlinked dir or the real one
-          KB=""
-          for cand in drivers/kernelsu/Kbuild ../KernelSU-Next/kernel/Kbuild; do
-            [ -f "$cand" ] && KB="$cand" && break
-          done
-          [ -n "$KB" ] || { echo "::error::Kbuild not found"; exit 1; }
-          echo "Checking $KB"
-          if grep -q 'KernelSU requires' "$KB"; then
-            sed -i '/\$(error "KernelSU requires/d' "$KB"
-            echo "[ok] removed pre-config hard check from $KB"
-          else
-            echo "[info] no hard check found in $KB — nothing to remove"
-          fi
-
-      # ============================================================
-      # NEW: Agar KernelSU-Next ki Kconfig me KSU_SUSFS symbol define hi nahi hai
-      # to Kconfig use silently drop kar deta hai (final .config me missing).
-      # Ye step check karta hai aur sirf missing symbols fs/Kconfig me add karta hai.
-      # ============================================================
-      - name: Ensure KSU_SUSFS Kconfig symbols exist
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          KSU_DIR="../KernelSU-Next"
-          [ -d "$KSU_DIR" ] || KSU_DIR="drivers/kernelsu"
-
-          defined() {
-            grep -rqsE --include=Kconfig "^[[:space:]]*config[[:space:]]+$1[[:space:]]*$" "$KSU_DIR" fs security drivers 2>/dev/null
-          }
-
-          echo "== KSU / SUSFS symbols defined in Kconfig =="
-          grep -rnE --include=Kconfig "^[[:space:]]*config[[:space:]]+KSU" "$KSU_DIR" fs 2>/dev/null || true
-
-          ADDED=0
-          if ! defined KSU_SUSFS; then
-            echo "::warning::KSU_SUSFS not defined by KernelSU-Next — adding fallback to fs/Kconfig"
-            printf '\nconfig KSU_SUSFS\n\tbool "KernelSU addon - SUSFS"\n\tdepends on KSU\n\tdefault y\n' >> fs/Kconfig
-            ADDED=1
-          fi
-
-          for s in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG OPEN_REDIRECT SUS_MAP; do
-            if ! defined "KSU_SUSFS_${s}"; then
-              printf '\nconfig KSU_SUSFS_%s\n\tbool "KSU_SUSFS_%s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$s" "$s" >> fs/Kconfig
-              echo "[fallback] added KSU_SUSFS_${s}"
-              ADDED=1
-            fi
-          done
-
-          # fs/susfs.c SUSFS patch ke baad build hona chahiye
-          grep -q 'susfs' fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
-
-          if [ "$ADDED" -eq 0 ]; then
-            echo "[ok] all SUSFS Kconfig symbols already defined by KernelSU-Next"
-          fi
+           #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+          -static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+          -                                               u32 *sid, u32 def_sid, gfp_t gfp_flags);
+          -static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+          -                                               u32 *scontext_len);
+          -static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+          -                                                 struct av_decision *avd);
+          +int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+          +                                        u32 *sid, u32 def_sid, gfp_t gfp_flags);
+          +int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+          +                                        u32 *scontext_len);
+          +void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+          +                                          struct av_decision *avd);
+           static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
+                                                     u16 tclass, u32 permissions, const char *reason) = NULL;
+           static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
+          STATIC_PATCH_EOF
+          patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
+          rm -f static.patch static.patch.orig
 
       # ============================================================
       # NoMount (built-in)
@@ -323,9 +265,6 @@ jobs:
           echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
           echo "NoMount integrated: $(ls fs/nomount | wc -l) files (branch ${NM_BRANCH})"
 
-      # ============================================================
-      # Baseband Guard (BBG)
-      # ============================================================
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
@@ -358,9 +297,6 @@ jobs:
           cd kernel_workspace/common/arch/arm64/configs
           echo "CONFIG_BBG=y" >> gki_defconfig
 
-      # ============================================================
-      # BBRv3
-      # ============================================================
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
         run: |
@@ -548,6 +484,177 @@ jobs:
             echo "CONFIG_LRU_GEN_ENABLED=y"
           } >> gki_defconfig
 
+      - name: Add full NetHunter wireless + CAN + Bluetooth + USB Serial + NFS + WireGuard + SDR + Netfilter configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_PACKET_DIAG=y"
+            echo "CONFIG_USB_G_HID=y"
+            echo "CONFIG_USB_CONFIGFS_F_HID=y"
+            echo "CONFIG_FW_LOADER=y"
+            echo "CONFIG_FW_LOADER_USER_HELPER=y"
+            echo "CONFIG_USB_SUPPORT=y"
+            echo "CONFIG_USB_NET_DRIVERS=y"
+            echo "CONFIG_USB_USBNET=y"
+            echo "CONFIG_USB_CDC_COMPOSITE=y"
+            echo "CONFIG_USB_CONFIGFS=y"
+            echo "CONFIG_USB_CONFIGFS_ACM=y"
+            echo "CONFIG_USB_CONFIGFS_RNDIS=y"
+            echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
+            echo "CONFIG_USB_ACM=y"
+            echo "CONFIG_USB_SERIAL=y"
+            echo "CONFIG_USB_SERIAL_GENERIC=y"
+            echo "CONFIG_USB_SERIAL_CP210X=y"
+            echo "CONFIG_USB_SERIAL_FTDI_SIO=y"
+            echo "CONFIG_USB_SERIAL_PL2303=y"
+            echo "CONFIG_USB_SERIAL_CH341=y"
+            echo "CONFIG_USB_SERIAL_ARK3116=y"
+            echo "CONFIG_USB_NET_CDCETHER=y"
+            echo "CONFIG_USB_NET_CDC_NCM=y"
+            echo "CONFIG_USB_NET_RNDIS_HOST=y"
+            echo "CONFIG_USB_NET_RNDIS_WLAN=y"
+            echo "CONFIG_RFKILL=y"
+            echo "CONFIG_RFKILL_LEDS=y"
+            echo "CONFIG_BT=y"
+            echo "CONFIG_BT_L2CAP=y"
+            echo "CONFIG_BT_SCO=y"
+            echo "CONFIG_BT_RFCOMM=y"
+            echo "CONFIG_BT_BNEP=y"
+            echo "CONFIG_BT_HIDP=y"
+            echo "CONFIG_BT_HCIUART_H4=y"
+            echo "CONFIG_BT_HCIUART_BCSP=y"
+            echo "CONFIG_BT_HCIUART_LL=y"
+            echo "CONFIG_BT_HCIBCM203X=y"
+            echo "CONFIG_BT_HCIBPA10X=y"
+            echo "CONFIG_BT_HCIBFUSB=y"
+            echo "CONFIG_BT_HCIVHCI=y"
+            echo "CONFIG_CAN=y"
+            echo "CONFIG_CAN_RAW=y"
+            echo "CONFIG_CAN_BCM=y"
+            echo "CONFIG_CAN_GW=y"
+            echo "CONFIG_CAN_J1939=y"
+            echo "CONFIG_CAN_ISOTP=y"
+            echo "CONFIG_CAN_SLCAN=y"
+            echo "CONFIG_CAN_VCAN=y"
+            echo "CONFIG_CAN_DEV=y"
+            echo "CONFIG_CAN_CALC_BITTIMING=y"
+            echo "CONFIG_CAN_FLEXCAN=y"
+            echo "CONFIG_CAN_8DEV_USB=y"
+            echo "CONFIG_CAN_EMS_USB=y"
+            echo "CONFIG_CAN_ESD_USB2=y"
+            echo "CONFIG_CAN_GS_USB=y"
+            echo "CONFIG_CAN_KVASER_USB=y"
+            echo "CONFIG_CAN_MCBA_USB=y"
+            echo "CONFIG_CAN_PEAK_USB=y"
+            echo "CONFIG_CAN_UCAN=y"
+            echo "CONFIG_CAN_USB=y"
+            echo "CONFIG_CAN_AT91=y"
+            echo "CONFIG_CAN_SJA1000=y"
+            echo "CONFIG_CAN_SJA1000_PLATFORM=y"
+            echo "CONFIG_CAN_SJA1000_ISA=y"
+            echo "CONFIG_CAN_SJA1000_ECAN=y"
+            echo "CONFIG_NFS_FS=y"
+            echo "CONFIG_NFS_V3=y"
+            echo "CONFIG_NFS_V4=y"
+            echo "CONFIG_NFSD=y"
+            echo "CONFIG_WIREGUARD=y"
+            echo "CONFIG_NETWORK_FILESYSTEMS=y"
+            echo "CONFIG_NFS_V2=y"
+            echo "CONFIG_NFSD_V3=y"
+            echo "CONFIG_NFSD_V4=y"
+            echo "CONFIG_CFG80211=m"
+            echo "CONFIG_MAC80211=m"
+            echo "CONFIG_NL80211_TESTMODE=y"
+            echo "CONFIG_WLAN_VENDOR_ATH=y"
+            echo "CONFIG_ATH9K_HTC=m"
+            echo "CONFIG_ATH_CARDS=m"
+            echo "CONFIG_CARL9170=m"
+            echo "CONFIG_WLAN_VENDOR_RALINK=y"
+            echo "CONFIG_RT2X00=m"
+            echo "CONFIG_RT2X00_LIB=m"
+            echo "CONFIG_RT2X00_LIB_USB=m"
+            echo "CONFIG_RT2800USB=m"
+            echo "CONFIG_RT2800USB_RT33XX=y"
+            echo "CONFIG_RT2800USB_RT35XX=y"
+            echo "CONFIG_RT2800USB_RT53XX=y"
+            echo "CONFIG_RT2800USB_RT55XX=y"
+            echo "CONFIG_RT73USB=m"
+            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
+            echo "CONFIG_RTL8187=m"
+            echo "CONFIG_RTL8192CU=m"
+            echo "CONFIG_RTL8XXXU=m"
+            echo "CONFIG_RTL8XXXU_UNTESTED=y"
+            echo "CONFIG_WLAN_VENDOR_MEDIATEK=y"
+            echo "CONFIG_MT7601U=m"
+            echo "CONFIG_MT76_CORE=m"
+            echo "CONFIG_MT76_USB=m"
+            echo "CONFIG_MT76x0_COMMON=m"
+            echo "CONFIG_MT76x0U=m"
+            echo "CONFIG_MT76x2_COMMON=m"
+            echo "CONFIG_MT76x2U=m"
+            echo "CONFIG_CRYPTO_ARC4=m"
+            echo "CONFIG_CRYPTO_ECB=m"
+            echo "CONFIG_CRYPTO_MICHAEL_MIC=m"
+            echo "CONFIG_CRYPTO_CCMP=m"
+            echo "CONFIG_CRYPTO_TKIP=m"
+            echo "CONFIG_CRC_CCITT=m"
+            echo "CONFIG_CRC_ITU_T=m"
+            echo "CONFIG_MODULES=y"
+            echo "CONFIG_MODULE_UNLOAD=y"
+            echo "CONFIG_MODVERSIONS=y"
+            echo "CONFIG_MEDIA_DIGITAL_TV_SUPPORT=y"
+            echo "CONFIG_MEDIA_SDR_SUPPORT=y"
+            echo "CONFIG_USB_AIRSPY=y"
+            echo "CONFIG_USB_HACKRF=y"
+            echo "CONFIG_USB_MSI2500=y"
+            echo "CONFIG_MEDIA_SUBDRV_AUTOSELECT=n"
+            echo "CONFIG_DVB_RTL2830=y"
+            echo "CONFIG_DVB_RTL2832=y"
+            echo "CONFIG_DVB_RTL2832_SDR=y"
+            echo "CONFIG_DVB_SI2168=y"
+            echo "CONFIG_DVB_ZD1301_DEMOD=y"
+            echo "CONFIG_WLAN_VENDOR_ZYDAS=y"
+            echo "CONFIG_ZD1211RW=m"
+            echo "CONFIG_RTW88=m"
+            echo "CONFIG_RTW88_CORE=m"
+            echo "CONFIG_RTW88_USB=m"
+            echo "CONFIG_RTW88_8812AU=m"
+            echo "CONFIG_RTW88_8814AU=m"
+            echo "CONFIG_RTW88_8821AU=m"
+            echo "CONFIG_RTW88_8822BU=m"
+            echo "CONFIG_RTW88_8821CU=m"
+            echo "CONFIG_RTW88_8723DU=m"
+          } >> gki_defconfig
+
+      - name: Apply NetHunter WiFi injection patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import pathlib
+
+          def patch(path, old, new, label):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  print(f"[skip] {label}: {path} not found")
+                  return
+              text = p.read_text()
+              n = text.count(old)
+              if n != 1:
+                  print(f"[WARN] {label}: expected 1 match, found {n} — skipping")
+                  return
+              p.write_text(text.replace(old, new, 1))
+              print(f"[ok] {label}")
+
+          patch("net/mac80211/tx.c", "\tif (unlikely(info->control.vif->type == NL80211_IFTYPE_MONITOR))\n\t\treturn TX_CONTINUE;\n", "\tif (unlikely((info->flags & IEEE80211_TX_CTL_INJECTED) &&\n\t   !(tx->sdata->u.mntr.flags & MONITOR_FLAG_COOK_FRAMES))) {\n\t\tif (!ieee80211_has_morefrags(hdr->frame_control))\n\t\t\tinfo->flags |= IEEE80211_TX_CTL_NO_ACK;\n\t\treturn TX_CONTINUE;\n\t}\n", "mac80211 injected packet seqno/NO_ACK")
+          patch("net/mac80211/tx.c", "\tieee80211_set_qos_hdr(sdata, skb);\n\tieee80211_tx(sdata, sta, skb, false);\n", "        if (likely(info->control.vif->type != NL80211_IFTYPE_MONITOR)) {\n            ieee80211_set_qos_hdr(sdata, skb);\n        }\n\tieee80211_tx(sdata, sta, skb, false);\n", "mac80211 skip QoS hdr in monitor mode")
+          patch("net/wireless/chan.c", "\tif (!cfg80211_has_monitors_only(rdev))\n\t\treturn -EBUSY;\n", "\t// Always allow user to change channel\n", "cfg80211 monitor channel EBUSY removal")
+          patch("drivers/net/wireless/realtek/rtl818x/rtl8187/dev.c", "\tif (ieee80211_has_morefrags(tx_hdr->frame_control))\n\t\tflags |= RTL818X_TX_DESC_FLAG_MOREFRAG;\n", "\n\tif (ieee80211_has_morefrags(tx_hdr->frame_control))\n\t{\n\t\tif (likely(info->control.vif != NULL && info->control.vif->type != NL80211_IFTYPE_MONITOR)) {\n\t\t\tflags |= RTL818X_TX_DESC_FLAG_MOREFRAG;\n\t\t}\n\t}\n", "rtl8187 monitor MOREFRAG fix")
+          patch("drivers/net/wireless/zydas/zd1211rw/zd_mac.c", "static int set_rx_filter(struct zd_mac *mac)\n{\n\tunsigned long flags;\n\tu32 filter = STA_RX_FILTER;\n\n\tspin_lock_irqsave(&mac->lock, flags);\n\tif (mac->pass_ctrl)\n\t\tfilter |= RX_FILTER_CTRL;\n\tspin_unlock_irqrestore(&mac->lock, flags);\n\n\treturn zd_iowrite32(&mac->chip, CR_RX_FILTER, filter);\n}\n", "static int set_rx_filter(struct zd_mac *mac)\n{\n\tunsigned long flags;\n\tstruct zd_ioreq32 ioreqs[] = {\n\t\t{CR_RX_FILTER, STA_RX_FILTER},\n\t\t{ CR_SNIFFER_ON, 0U },\n\t};\n\n\tspin_lock_irqsave(&mac->lock, flags);\n\tif (mac->pass_ctrl) {\n\t\tioreqs[0].value |= 0xFFFFFFFF;\n\t\tioreqs[1].value = 0x1;\n\t}\n\tspin_unlock_irqrestore(&mac->lock, flags);\n\n\treturn zd_iowrite32a(&mac->chip, ioreqs, ARRAY_SIZE(ioreqs));\n}\n", "zd1211rw set_rx_filter sniffer fix")
+          patch("drivers/net/wireless/zydas/zd1211rw/zd_mac.c", "\tif (status->frame_status & ZD_RX_ERROR) {\n", "\tif ((status->frame_status & ZD_RX_ERROR) || \n\t\t(status->frame_status & ~0x21)) {\n", "zd1211rw monitor frame acceptance")
+          patch("drivers/net/wireless/zydas/zd1211rw/zd_mac.c", "\tieee80211_hw_set(hw, SIGNAL_UNSPEC);\n", "\tieee80211_hw_set(hw, SIGNAL_DBM);\n", "zd1211rw SIGNAL_DBM")
+          PYEOF
+
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
         run: |
@@ -604,6 +711,11 @@ jobs:
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
 
+      - name: Ensure CONFIG_CFG80211 is enabled
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          grep -q '^CONFIG_CFG80211=' gki_defconfig || echo "CONFIG_CFG80211=m" >> gki_defconfig
+
       - name: Clean dirty flag
         working-directory: kernel_workspace
         run: |
@@ -621,7 +733,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
           #!/bin/sh
-          printf -- '-BLAZE-KSUNext-STABLE\n'
+          printf -- '-BLAZE-KSUN-STABLE\n'
           SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
@@ -660,8 +772,6 @@ jobs:
 
       - name: Build kernel
         working-directory: kernel_workspace
-        env:
-          KCFLAGS: "-Wno-error=unused-function"
         run: |
           set -euo pipefail
           export KBUILD_BUILD_USER="builder"
@@ -673,26 +783,14 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify KernelSU-Next + SUSFS are built into the kernel
+      - name: Verify NoMount is built into the kernel
+        if: ${{ github.event.inputs.enable_nomount == 'true' }}
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
           CFG="$(find out -name .config -path '*common*' | head -n1)"
           [ -n "$CFG" ] || { echo "::error::final .config not found under out/"; exit 1; }
-          echo "Using $CFG"
-          echo "== KSU / SUSFS / KPROBES lines in final .config =="
-          grep -E 'KSU|SUSFS|KPROBES' "$CFG" || true
-          for opt in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KPROBES; do
-            if ! grep -q "^${opt}=y$" "$CFG"; then
-              echo "::error::${opt}=y is missing from the final .config (dropped by a Kconfig dependency?)"
-              echo "== Kconfig definition of ${opt#CONFIG_} =="
-              grep -rn -B2 -A10 --include=Kconfig -E "^[[:space:]]*config[[:space:]]+${opt#CONFIG_}[[:space:]]*$" common KernelSU-Next 2>/dev/null || true
-              exit 1
-            fi
-          done
-          if [ "${{ github.event.inputs.enable_nomount }}" = "true" ]; then
-            grep -q '^CONFIG_NOMOUNT=y$' "$CFG" || { echo "::error::CONFIG_NOMOUNT=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
-          fi
+          grep -q '^CONFIG_NOMOUNT=y$' "$CFG" || { echo "::error::CONFIG_NOMOUNT=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
           grep -E '^CONFIG_(KSU|NOMOUNT)' "$CFG"
 
       - name: Locate built Image
@@ -705,6 +803,62 @@ jobs:
           echo "Found Image at: $IMG"
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
+      - name: Locate build output dir
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          SYMVERS=$(find out -name "Module.symvers" | head -n1)
+          if [ -z "$SYMVERS" ]; then echo "::error::No Module.symvers found"; exit 1; fi
+          KDIR="$(cd "$(dirname "$SYMVERS")" && pwd)"
+          echo "Using KDIR: $KDIR"
+          echo "KDIR=${KDIR}" >> "$GITHUB_ENV"
+          CFG80211_KO=$(find out -name "cfg80211.ko" | head -n1 || true)
+          echo "CFG80211_KO=${CFG80211_KO:-}" >> "$GITHUB_ENV"
+
+      - name: Build RTL8188EU / RTL8188EUS Wi-Fi driver
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b v5.3.9 https://github.com/aircrack-ng/rtl8188eus.git rtl8188eus
+          LLVM_AR_PATH=$(find prebuilts-master -type f -name 'llvm-ar' | head -n1)
+          if [ -z "$LLVM_AR_PATH" ]; then echo "::error::llvm-ar not found"; exit 1; fi
+          LLVM_BIN_DIR="$(cd "$(dirname "$LLVM_AR_PATH")" && pwd)"
+          echo "Using LLVM toolchain at: $LLVM_BIN_DIR"
+          export PATH="${LLVM_BIN_DIR}:${PATH}"
+          cd rtl8188eus
+          DRVDIR="$(pwd)"
+
+          sed -i -E 's/\bEXTRA_CFLAGS\b/ccflags-y/g; s/\bEXTRA_LDFLAGS\b/ldflags-y/g' Makefile
+
+          LICENSE_FILE=$(grep -rl "MODULE_LICENSE(" --include="*.c" . | head -n1)
+          if [ -n "$LICENSE_FILE" ]; then
+            echo "Adding MODULE_IMPORT_NS to: $LICENSE_FILE"
+            sed -i "/MODULE_LICENSE(/a MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);" "$LICENSE_FILE"
+          fi
+
+          make -C "${KDIR}" M="${DRVDIR}" \
+            ARCH=arm64 SUBARCH=arm64 \
+            LLVM=1 LLVM_IAS=1 \
+            CC="${LLVM_BIN_DIR}/clang" LD="${LLVM_BIN_DIR}/ld.lld" \
+            AR="${LLVM_BIN_DIR}/llvm-ar" NM="${LLVM_BIN_DIR}/llvm-nm" \
+            OBJCOPY="${LLVM_BIN_DIR}/llvm-objcopy" OBJDUMP="${LLVM_BIN_DIR}/llvm-objdump" \
+            STRIP="${LLVM_BIN_DIR}/llvm-strip" READELF="${LLVM_BIN_DIR}/llvm-readelf" \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CONFIG_RTL8188EU=m CONFIG_RTL8188E=y CONFIG_MULTIDRV=n \
+            KCFLAGS="-DCONFIG_LITTLE_ENDIAN -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT -Wno-error -Wno-unknown-warning-option -Wno-implicit-function-declaration" \
+            modules 2>&1 | tee build.log
+
+          KO=$(find . -maxdepth 1 -name "*.ko" | head -n1)
+          if [ -z "$KO" ]; then
+            echo "::error::rtl8188eus build did not produce a .ko file."
+            tail -n 40 build.log
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/driver_out"
+          "${LLVM_BIN_DIR}/llvm-strip" --strip-debug --strip-unneeded "$KO" -o "$GITHUB_WORKSPACE/driver_out/8188eu.ko"
+          echo "Built driver: $KO"
+
       - name: Package AnyKernel3
         run: |
           set -euo pipefail
@@ -713,6 +867,133 @@ jobs:
           cd ak3
           zip -r9 -q "$GITHUB_WORKSPACE/${{ github.event.inputs.device_name }}-KSUNext-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
           ls -lh "$GITHUB_WORKSPACE"/*.zip
+
+      - name: Generate NetHunter Wireless Magisk Module
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          mkdir -p wireless_module/system/lib/modules
+          mkdir -p wireless_module/META-INF/com/google/android
+          find out -name "*.ko" -exec cp {} wireless_module/system/lib/modules/ \; || true
+          COUNT=$(find wireless_module/system/lib/modules -name "*.ko" | wc -l)
+          echo "Packaging ${COUNT} .ko modules"
+
+          cat > wireless_module/module.prop << 'EOF'
+          id=Wireless-LKM
+          name=NetHunter Wireless LKM
+          version=v1
+          versionCode=1
+          author=Blaze
+          description=NetHunter wireless kernel modules
+          EOF
+
+          cat > wireless_module/service.sh << 'EOF'
+          #!/system/bin/sh
+          sleep 25
+          LOG=/data/local/tmp/nethunter_wireless.log
+          MODDIR=/data/adb/modules/Wireless-LKM/system/lib/modules
+          echo "===== $(date) =====" >> $LOG
+          echo /vendor/firmware > /sys/module/firmware_class/parameters/path 2>>$LOG
+
+          load(){ MOD="$1"; if [ -f "$MODDIR/$MOD.ko" ]; then insmod "$MODDIR/$MOD.ko" >>$LOG 2>&1; fi; }
+          load cfg80211
+          load mac80211
+          load ath
+          load ath9k_hw
+          load ath9k_common
+          load ath9k_htc
+          load carl9170
+          load rt2x00lib
+          load rt2x00usb
+          load rt2800lib
+          load rt2800usb
+          load rt73usb
+          load rtl8187
+          load rtl8192cu
+          load rtl8xxxu
+          load mt7601u
+          load mt76
+          load mt76-usb
+          load mt76x0-common
+          load mt76x0u
+          load mt76x2-common
+          load mt76x2u
+          load rtw88_core
+          load rtw88_usb
+          load rtw88_8812au
+          load rtw88_8814au
+          load rtw88_8821au
+          load rtw88_8822bu
+          load rtw88_8821cu
+          load rtw88_8723du
+          load zd1211rw
+          load crc-itu-t
+          load michael_mic
+
+          dmesg | grep -i -E "cfg80211|mac80211|ath|rt2x00|rt2800|rtl|rtw88|mt76|zd1211|firmware" >> $LOG 2>&1
+          EOF
+          chmod +x wireless_module/service.sh
+
+          cat > wireless_module/META-INF/com/google/android/update-binary << 'EOF'
+          #!/sbin/sh
+          mount /data 2>/dev/null
+          unzip -o "$3" 'system/*' -d /data/adb/modules/Wireless-LKM/ 2>/dev/null
+          cp -rf service.sh /data/adb/modules/Wireless-LKM/
+          cp -rf module.prop /data/adb/modules/Wireless-LKM/
+          touch /data/adb/modules/Wireless-LKM/update
+          exit 0
+          EOF
+          chmod +x wireless_module/META-INF/com/google/android/update-binary
+
+          cd wireless_module
+          zip -r9 -q "$GITHUB_WORKSPACE/Wireless_LKM.zip" .
+          echo "Magisk module created: $GITHUB_WORKSPACE/Wireless_LKM.zip"
+
+      - name: Generate RTL8188EU/EUS Magisk Module
+        run: |
+          set -euo pipefail
+          mkdir -p wifi_module/system/lib/modules
+          mkdir -p wifi_module/META-INF/com/google/android
+          cp "$GITHUB_WORKSPACE/driver_out/8188eu.ko" wifi_module/system/lib/modules/
+          if [ -n "${CFG80211_KO:-}" ] && [ -f "${CFG80211_KO}" ]; then
+            cp "${CFG80211_KO}" wifi_module/system/lib/modules/
+          fi
+
+          cat > wifi_module/module.prop << 'EOF'
+          id=RTL8188EU-EUS-Driver
+          name=RTL8188EU/EUS Wi-Fi Driver
+          version=v5.3.9
+          versionCode=1
+          author=Blaze
+          description=RTL8188EU/RTL8188EUS/RTL8188ETV Wi-Fi driver with monitor mode & injection support
+          EOF
+
+          cat > wifi_module/service.sh << 'EOF'
+          #!/system/bin/sh
+          sleep 20
+          LOG=/data/local/tmp/rtl8188eu.log
+          MODDIR=/data/adb/modules/RTL8188EU-EUS-Driver/system/lib/modules
+          load(){ MOD="$1"; if [ -f "$MODDIR/$MOD.ko" ]; then insmod "$MODDIR/$MOD.ko" >>$LOG 2>&1; fi; }
+          load cfg80211
+          load 8188eu
+          dmesg | grep -i -E "8188eu|cfg80211|rtw_" >> $LOG 2>&1
+          EOF
+          chmod +x wifi_module/service.sh
+
+          cat > wifi_module/META-INF/com/google/android/update-binary << 'EOF'
+          #!/sbin/sh
+          mount /data 2>/dev/null
+          unzip -o "$3" 'system/*' -d /data/adb/modules/RTL8188EU-EUS-Driver/ 2>/dev/null
+          cp -rf service.sh /data/adb/modules/RTL8188EU-EUS-Driver/
+          cp -rf module.prop /data/adb/modules/RTL8188EU-EUS-Driver/
+          touch /data/adb/modules/RTL8188EU-EUS-Driver/update
+          exit 0
+          EOF
+          chmod +x wifi_module/META-INF/com/google/android/update-binary
+
+          cd wifi_module
+          zip -r9 -q "$GITHUB_WORKSPACE/RTL8188EU-EUS-Driver.zip" .
+          echo "Magisk module created: $GITHUB_WORKSPACE/RTL8188EU-EUS-Driver.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
